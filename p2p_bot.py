@@ -408,7 +408,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Auto-refresh  : `{auto_s}`\n"
         f"  Last fetch    : `{last_s}`\n"
         f"  Cached results: `{len(state['last_results'])}`\n"
-        f"  Excluded pay  : `{', '.join(EXCLUDED_PAYMENT_METHODS)}`"
+        f"  Allowed pay   : `{', '.join(ALLOWED_PAYMENT_METHODS)}`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
