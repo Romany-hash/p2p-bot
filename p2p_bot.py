@@ -217,8 +217,8 @@ def fmt_results(results, usdt_amount, label="📊 Latest Rates"):
 
 
 def fmt_alert(r, usdt_amount, threshold):
-    non_excluded = [p for p in r["payment_methods"]
-                    if p not in EXCLUDED_PAYMENT_METHODS]
+        non_excluded = [p for p in r["payment_methods"]
+                    if p in ALLOWED_PAYMENT_METHODS]
     ts  = datetime.datetime.now().strftime("%H:%M:%S")
     egp = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
     return "\n".join([
