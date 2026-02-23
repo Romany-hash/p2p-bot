@@ -1,13 +1,11 @@
 import os
+import asyncio
 import requests
-import threading
 import datetime
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -53,7 +51,7 @@ state = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# BACKEND  (runs in thread pool — blocking requests are fine)
+# BACKEND
 # ─────────────────────────────────────────────────────────────
 def get_exchange_rate_to_egp(from_currency, amount):
     if from_currency == "EGP":
@@ -64,7 +62,7 @@ def get_exchange_rate_to_egp(from_currency, amount):
         data = r.json()
         if "rates" in data and "EGP" in data["rates"]:
             return amount * data["rates"]["EGP"]
-        r2   = requests.get("https://api.exchangerate-api.com/v4/latest/EGP", timeout=5)
+        r2    = requests.get("https://api.exchangerate-api.com/v4/latest/EGP", timeout=5)
         data2 = r2.json()
         if "rates" in data2 and from_currency in data2["rates"]:
             return amount / data2["rates"][from_currency]
@@ -100,6 +98,7 @@ def get_p2p_price_for_currency(currency, usdt_amount):
         if not ads:
             return {"currency": currency, "success": False, "error": "No ads"}
 
+        # Filter by amount and availability
         valid = []
         for ad in ads:
             mn  = float(ad["adv"]["minSingleTransAmount"])
@@ -108,11 +107,11 @@ def get_p2p_price_for_currency(currency, usdt_amount):
             if mn <= usdt_amount <= mx and avl >= usdt_amount:
                 valid.append(ad)
 
-               if not valid:
+        if not valid:
             return {"currency": currency, "success": False,
                     "error": f"No merchant accepts {usdt_amount} USDT"}
 
-        # Keep only ads that have at least one allowed payment method
+        # Filter by allowed payment methods
         valid = [
             ad for ad in valid
             if any(
@@ -179,8 +178,8 @@ def fmt_results(results, usdt_amount, label="📊 Latest Rates"):
     if not results:
         return "❌ No results found."
 
-    ts   = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
-    best = results[0]
+    ts       = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
+    best     = results[0]
     egp_best = f"{best['egp_equivalent']:,.2f}" if best.get("egp_equivalent") else "N/A"
 
     lines = [
@@ -217,8 +216,7 @@ def fmt_results(results, usdt_amount, label="📊 Latest Rates"):
 
 
 def fmt_alert(r, usdt_amount, threshold):
-        non_excluded = [p for p in r["payment_methods"]
-                    if p in ALLOWED_PAYMENT_METHODS]
+    allowed_pays = [p for p in r["payment_methods"] if p in ALLOWED_PAYMENT_METHODS]
     ts  = datetime.datetime.now().strftime("%H:%M:%S")
     egp = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
     return "\n".join([
@@ -231,7 +229,7 @@ def fmt_alert(r, usdt_amount, threshold):
         f"  Threshold : `{threshold:,.2f}` EGP exceeded",
         f"  Merchant  : `{r['merchant']}` ({r['completion_pct']}%)",
         f"  Orders/mo : {r['monthly_orders']}",
-        f"  Payment   : {', '.join(non_excluded)}",
+        f"  Payment   : {', '.join(allowed_pays)}",
         f"  Limits    : {r['min']:.0f} - {r['max']:.0f} USDT",
         f"  Available : {r['available']:.2f} USDT",
     ])
@@ -250,8 +248,7 @@ async def check_and_send_alerts(bot, results, usdt_amount):
         if not egp or egp <= threshold:
             continue
 
-               allowed_pays = [p for p in r["payment_methods"]
-                        if p in ALLOWED_PAYMENT_METHODS]
+        allowed_pays = [p for p in r["payment_methods"] if p in ALLOWED_PAYMENT_METHODS]
         if not allowed_pays:
             continue
 
@@ -271,7 +268,7 @@ async def check_and_send_alerts(bot, results, usdt_amount):
 
 
 # ─────────────────────────────────────────────────────────────
-# COMMANDS  (all async in v20)
+# COMMANDS
 # ─────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -296,10 +293,7 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     state["alerted_keys"].clear()
 
-    import asyncio
-    loop = asyncio.get_event_loop()
-
-    # Run blocking fetch in executor so bot stays responsive
+    loop    = asyncio.get_event_loop()
     results = await loop.run_in_executor(
         None, fetch_all_blocking, state["usdt_amount"]
     )
@@ -344,7 +338,7 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["alerted_keys"].clear()
         await update.message.reply_text(
             f"🔔 Alert set for `{threshold:,.2f}` EGP\n"
-            f"_Alipay excluded from alerts_",
+            f"_Only Bank Transfer, Faster Payment, Instant Transfer_",
             parse_mode="Markdown"
         )
     except (IndexError, ValueError):
@@ -367,7 +361,6 @@ async def cmd_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["auto_interval"] = interval
         state["auto_active"]   = True
 
-        # Remove existing job if any
         current = context.job_queue.get_jobs_by_name("auto_refresh")
         for job in current:
             job.schedule_removal()
@@ -433,8 +426,7 @@ async def _auto_refresh_job(context: ContextTypes.DEFAULT_TYPE):
         return
     logger.info("Auto-refresh running...")
 
-    import asyncio
-    loop = asyncio.get_event_loop()
+    loop    = asyncio.get_event_loop()
     results = await loop.run_in_executor(
         None, fetch_all_blocking, state["usdt_amount"]
     )
@@ -462,7 +454,7 @@ def main():
     app.add_handler(CommandHandler("top5",        cmd_top5))
 
     logger.info("Bot is running...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
