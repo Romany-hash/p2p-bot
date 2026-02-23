@@ -250,9 +250,9 @@ async def check_and_send_alerts(bot, results, usdt_amount):
         if not egp or egp <= threshold:
             continue
 
-        non_excluded = [p for p in r["payment_methods"]
-                        if p not in EXCLUDED_PAYMENT_METHODS]
-        if not non_excluded:
+               allowed_pays = [p for p in r["payment_methods"]
+                        if p in ALLOWED_PAYMENT_METHODS]
+        if not allowed_pays:
             continue
 
         key = (r["currency"], round(r["price"], 4))
