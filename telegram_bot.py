@@ -1,3 +1,4 @@
+import os
 import requests
 import threading
 import time
@@ -6,20 +7,18 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Update, ParseMode
 from telegram.ext import (
-    Updater, CommandHandler, MessageHandler,
-    Filters, CallbackContext, JobQueue
+    Updater, CommandHandler,
+    CallbackContext,
 )
 
-import os
-
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION — reads from Railway environment variables
+# ─────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = int(os.environ.get("CHAT_ID", "0"))
 
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION  ← fill these in
-# ─────────────────────────────────────────────────────────────
-BOT_TOKEN = "8688355914:AAFx9QZ_WcxBC70w767uljM-S5b9TqI_zSw"
-CHAT_ID   = 1103734024          # your numeric chat ID from Step 2
+if not BOT_TOKEN or CHAT_ID == 0:
+    raise ValueError("BOT_TOKEN and CHAT_ID must be set in environment variables")
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -38,20 +37,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ─────────────────────────────────────────────────────────────
-# STATE  (shared between commands and the background job)
+# STATE
 # ─────────────────────────────────────────────────────────────
 state = {
-    "usdt_amount":      100.0,
-    "threshold_egp":    None,     # None = no alert
-    "auto_interval":    60,       # seconds between auto-refresh
-    "auto_active":      False,
-    "last_fetch":       None,
-    "last_results":     [],
-    "alerted_keys":     set(),    # dedup alerts
+    "usdt_amount":    100.0,
+    "threshold_egp":  None,
+    "auto_interval":  60,
+    "auto_active":    False,
+    "last_fetch":     None,
+    "last_results":   [],
+    "alerted_keys":   set(),
 }
-
 
 # ─────────────────────────────────────────────────────────────
 # BACKEND
@@ -128,8 +125,8 @@ def get_p2p_price_for_currency(currency, usdt_amount):
             "max":               float(best["adv"]["dynamicMaxSingleTransAmount"]),
             "available":         float(best["adv"]["surplusAmount"]),
             "completion_pct":    round(
-                                     float(best["advertiser"].get("monthFinishRate", 0)) * 100, 2
-                                 ),
+                float(best["advertiser"].get("monthFinishRate", 0)) * 100, 2
+            ),
             "monthly_orders":    int(best["advertiser"].get("monthOrderCount", 0)),
             "valid_ads_found":   len(valid),
             "success":           True,
@@ -161,7 +158,7 @@ def fetch_all(usdt_amount, max_workers=10):
 
 
 # ─────────────────────────────────────────────────────────────
-# MESSAGE FORMATTERS
+# FORMATTERS
 # ─────────────────────────────────────────────────────────────
 def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
     if not results:
@@ -180,7 +177,7 @@ def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
         f"  Price     : `{best['price']:.4f}` {best['currency']}/USDT",
         f"  You get   : `{best['total_in_currency']:,.2f}` {best['currency']}",
         f"  EGP equiv : `{best['egp_equivalent']:,.2f}` EGP",
-        f"  Merchant  : {best['merchant']} ({best['completion_pct']}%)",
+        f"  Merchant  : {best['merchant']} \\({best['completion_pct']}%\\)",
         f"  Payment   : {', '.join(best['payment_methods'][:3])}",
         f"  Limits    : {best['min']:.0f} – {best['max']:.0f} USDT",
         "",
@@ -191,11 +188,11 @@ def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
 
     for i, r in enumerate(results[:10]):
         egp_s = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
-        medal = ["🥇","🥈","🥉"][i] if i < 3 else f"  {i+1}."
+        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"  {i+1}\\."
         lines.append(
             f"{medal} `{r['currency']}` — "
-            f"`{r['price']:.4f}` → `{egp_s}` EGP | "
-            f"{r['merchant']} | {', '.join(r['payment_methods'][:2])}"
+            f"`{r['price']:.4f}` → `{egp_s}` EGP \\| "
+            f"{r['merchant']} \\| {', '.join(r['payment_methods'][:2])}"
         )
 
     lines += [
@@ -206,7 +203,8 @@ def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
 
 
 def fmt_alert_message(r, usdt_amount, threshold):
-    non_excluded = [p for p in r["payment_methods"] if p not in EXCLUDED_PAYMENT_METHODS]
+    non_excluded = [p for p in r["payment_methods"]
+                    if p not in EXCLUDED_PAYMENT_METHODS]
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     return "\n".join([
         f"🚨 *PRICE ALERT*  `{ts}`",
@@ -216,7 +214,7 @@ def fmt_alert_message(r, usdt_amount, threshold):
         f"  You get   : `{r['total_in_currency']:,.2f}` {r['currency']}",
         f"  EGP equiv : `{r['egp_equivalent']:,.2f}` EGP",
         f"  Threshold : `{threshold:,.2f}` EGP  ⬆️ EXCEEDED",
-        f"  Merchant  : {r['merchant']}  ({r['completion_pct']}%)",
+        f"  Merchant  : {r['merchant']}  \\({r['completion_pct']}%\\)",
         f"  Orders/mo : {r['monthly_orders']}",
         f"  Payment   : {', '.join(non_excluded)}",
         f"  Limits    : {r['min']:.0f} – {r['max']:.0f} USDT",
@@ -225,7 +223,7 @@ def fmt_alert_message(r, usdt_amount, threshold):
 
 
 # ─────────────────────────────────────────────────────────────
-# ALERT CHECKER  (called after every fetch)
+# ALERT CHECKER
 # ─────────────────────────────────────────────────────────────
 def check_and_send_alerts(bot, results, usdt_amount):
     threshold = state["threshold_egp"]
@@ -237,39 +235,41 @@ def check_and_send_alerts(bot, results, usdt_amount):
         if not egp or egp <= threshold:
             continue
 
-        non_excluded = [p for p in r["payment_methods"] if p not in EXCLUDED_PAYMENT_METHODS]
+        non_excluded = [p for p in r["payment_methods"]
+                        if p not in EXCLUDED_PAYMENT_METHODS]
         if not non_excluded:
-            continue   # all payment methods are excluded (e.g. only Alipay)
+            continue
 
         key = (r["currency"], round(r["price"], 4))
         if key in state["alerted_keys"]:
-            continue   # already sent this alert
+            continue
         state["alerted_keys"].add(key)
 
         msg = fmt_alert_message(r, usdt_amount, threshold)
         try:
-            bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+            bot.send_message(
+                chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN_V2
+            )
             logger.info(f"Alert sent: {r['currency']} @ {r['price']}")
         except Exception as e:
             logger.error(f"Failed to send alert: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-# BOT COMMANDS
+# COMMANDS
 # ─────────────────────────────────────────────────────────────
 def cmd_start(update: Update, context: CallbackContext):
     msg = (
         "👋 *Binance P2P Rate Bot*\n\n"
-        "Available commands:\n\n"
-        "*/fetch* — fetch prices now\n"
-        "*/setamount 500* — set USDT amount\n"
-        "*/setalert 650000* — alert when EGP equiv exceeds this\n"
-        "*/cancelalert* — disable alert\n"
-        "*/autostart 60* — auto-refresh every N seconds\n"
-        "*/autostop* — stop auto-refresh\n"
-        "*/status* — show current settings\n"
-        "*/top5* — show top 5 offers only\n"
-        "*/help* — show this message\n"
+        "Commands:\n\n"
+        "/fetch — fetch prices now\n"
+        "/setamount 500 — set USDT amount\n"
+        "/setalert 650000 — alert when EGP exceeds value\n"
+        "/cancelalert — disable alert\n"
+        "/autostart 60 — auto check every N seconds\n"
+        "/autostop — stop auto refresh\n"
+        "/status — show current settings\n"
+        "/top5 — show top 5 from last fetch\n"
     )
     update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -279,16 +279,21 @@ def cmd_fetch(update: Update, context: CallbackContext):
         f"⏳ Fetching rates for `{state['usdt_amount']} USDT`…",
         parse_mode=ParseMode.MARKDOWN
     )
-    state["alerted_keys"].clear()   # allow fresh alerts on manual fetch
+    state["alerted_keys"].clear()
 
     def worker():
-        results, errors = fetch_all(state["usdt_amount"])
+        results, _ = fetch_all(state["usdt_amount"])
         state["last_results"] = results
         state["last_fetch"]   = datetime.datetime.now()
         msg = fmt_results_message(results, state["usdt_amount"])
-        context.bot.send_message(
-            chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN
-        )
+        try:
+            context.bot.send_message(
+                chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+            # fallback without markdown
+            context.bot.send_message(chat_id=CHAT_ID, text=msg)
         check_and_send_alerts(context.bot, results, state["usdt_amount"])
 
     threading.Thread(target=worker, daemon=True).start()
@@ -301,12 +306,11 @@ def cmd_setamount(update: Update, context: CallbackContext):
             raise ValueError
         state["usdt_amount"] = amount
         state["alerted_keys"].clear()
-        update.message.reply_text(
-            f"✅ USDT amount set to `{amount}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        update.message.reply_text(f"✅ Amount set to `{amount}` USDT",
+                                  parse_mode=ParseMode.MARKDOWN)
     except (IndexError, ValueError):
-        update.message.reply_text("❌ Usage: `/setamount 500`", parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text("❌ Usage: `/setamount 500`",
+                                  parse_mode=ParseMode.MARKDOWN)
 
 
 def cmd_setalert(update: Update, context: CallbackContext):
@@ -314,18 +318,16 @@ def cmd_setalert(update: Update, context: CallbackContext):
         threshold = float(context.args[0].replace(",", ""))
         if threshold <= 0:
             raise ValueError
-        state["threshold_egp"]  = threshold
+        state["threshold_egp"] = threshold
         state["alerted_keys"].clear()
         update.message.reply_text(
-            f"🔔 Alert set\\! I'll notify you when EGP equivalent exceeds "
-            f"`{threshold:,.2f}` EGP\n"
-            f"_(Alipay payments are excluded from alerts)_",
+            f"🔔 Alert set for `{threshold:,.2f}` EGP\n"
+            f"_Alipay excluded from alerts_",
             parse_mode=ParseMode.MARKDOWN
         )
     except (IndexError, ValueError):
-        update.message.reply_text(
-            "❌ Usage: `/setalert 650000`", parse_mode=ParseMode.MARKDOWN
-        )
+        update.message.reply_text("❌ Usage: `/setalert 650000`",
+                                  parse_mode=ParseMode.MARKDOWN)
 
 
 def cmd_cancelalert(update: Update, context: CallbackContext):
@@ -338,34 +340,31 @@ def cmd_autostart(update: Update, context: CallbackContext):
     try:
         interval = int(context.args[0]) if context.args else 60
         if interval < 10:
-            raise ValueError("Minimum interval is 10 seconds")
+            raise ValueError
         state["auto_interval"] = interval
         state["auto_active"]   = True
 
-        # Remove old job if any, then add new one
-        current_jobs = context.job_queue.get_jobs_by_name("auto_refresh")
-        for job in current_jobs:
+        for job in context.job_queue.get_jobs_by_name("auto_refresh"):
             job.schedule_removal()
 
         context.job_queue.run_repeating(
             _auto_refresh_job,
             interval=interval,
-            first=0,
+            first=5,
             name="auto_refresh"
         )
         update.message.reply_text(
-            f"▶️ Auto-refresh started every `{interval}` seconds.",
+            f"▶️ Auto-refresh every `{interval}` seconds started.",
             parse_mode=ParseMode.MARKDOWN
         )
-    except (ValueError, IndexError) as e:
-        update.message.reply_text(f"❌ Usage: `/autostart 60`\n{e}",
+    except (ValueError, IndexError):
+        update.message.reply_text("❌ Usage: `/autostart 60` (minimum 10)",
                                   parse_mode=ParseMode.MARKDOWN)
 
 
 def cmd_autostop(update: Update, context: CallbackContext):
     state["auto_active"] = False
-    current_jobs = context.job_queue.get_jobs_by_name("auto_refresh")
-    for job in current_jobs:
+    for job in context.job_queue.get_jobs_by_name("auto_refresh"):
         job.schedule_removal()
     update.message.reply_text("⏹ Auto-refresh stopped.")
 
@@ -375,14 +374,13 @@ def cmd_status(update: Update, context: CallbackContext):
     last      = state["last_fetch"]
     last_s    = last.strftime("%H:%M:%S") if last else "Never"
     auto_s    = f"every {state['auto_interval']}s" if state["auto_active"] else "OFF"
-
     msg = (
-        f"⚙️ *Current Settings*\n\n"
+        f"⚙️ *Settings*\n\n"
         f"  USDT amount  : `{state['usdt_amount']}`\n"
         f"  Alert thresh : `{f'{threshold:,.2f} EGP' if threshold else 'Disabled'}`\n"
         f"  Auto-refresh : `{auto_s}`\n"
         f"  Last fetch   : `{last_s}`\n"
-        f"  Results cached : `{len(state['last_results'])}`\n"
+        f"  Cached results: `{len(state['last_results'])}`\n"
         f"  Excluded pay : `{', '.join(EXCLUDED_PAYMENT_METHODS)}`"
     )
     update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -391,29 +389,26 @@ def cmd_status(update: Update, context: CallbackContext):
 def cmd_top5(update: Update, context: CallbackContext):
     results = state["last_results"]
     if not results:
-        update.message.reply_text("No data yet. Run /fetch first.")
+        update.message.reply_text("No data yet. Use /fetch first.")
         return
-    msg = fmt_results_message(results[:5], state["usdt_amount"], label="📊 Top 5 Offers")
-    update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-def cmd_help(update: Update, context: CallbackContext):
-    cmd_start(update, context)
+    msg = fmt_results_message(results[:5], state["usdt_amount"],
+                               label="📊 Top 5 Offers")
+    try:
+        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        update.message.reply_text(msg)
 
 
 # ─────────────────────────────────────────────────────────────
-# AUTO-REFRESH JOB
+# AUTO REFRESH JOB
 # ─────────────────────────────────────────────────────────────
 def _auto_refresh_job(context: CallbackContext):
     if not state["auto_active"]:
         return
-    logger.info("Auto-refresh triggered")
-
-    results, errors = fetch_all(state["usdt_amount"])
+    logger.info("Auto-refresh running...")
+    results, _ = fetch_all(state["usdt_amount"])
     state["last_results"] = results
     state["last_fetch"]   = datetime.datetime.now()
-
-    # Only send full table if there's an alert; otherwise just run alert checks silently
     check_and_send_alerts(context.bot, results, state["usdt_amount"])
 
 
@@ -425,7 +420,7 @@ def main():
     dp      = updater.dispatcher
 
     dp.add_handler(CommandHandler("start",       cmd_start))
-    dp.add_handler(CommandHandler("help",        cmd_help))
+    dp.add_handler(CommandHandler("help",        cmd_start))
     dp.add_handler(CommandHandler("fetch",       cmd_fetch))
     dp.add_handler(CommandHandler("setamount",   cmd_setamount))
     dp.add_handler(CommandHandler("setalert",    cmd_setalert))
@@ -435,7 +430,7 @@ def main():
     dp.add_handler(CommandHandler("status",      cmd_status))
     dp.add_handler(CommandHandler("top5",        cmd_top5))
 
-    logger.info("Bot started. Waiting for commands...")
+    logger.info("Bot is running...")
     updater.start_polling()
     updater.idle()
 
