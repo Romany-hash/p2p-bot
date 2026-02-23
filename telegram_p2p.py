@@ -10,6 +10,10 @@ from telegram.ext import (
     Filters, CallbackContext, JobQueue
 )
 
+import os
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID   = int(os.environ.get("CHAT_ID", "0"))
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION  ← fill these in
 # ─────────────────────────────────────────────────────────────
@@ -436,4 +440,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
