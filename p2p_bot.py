@@ -108,13 +108,29 @@ def get_p2p_price_for_currency(currency, usdt_amount):
             if mn <= usdt_amount <= mx and avl >= usdt_amount:
                 valid.append(ad)
 
-        if not valid:
+               if not valid:
             return {"currency": currency, "success": False,
                     "error": f"No merchant accepts {usdt_amount} USDT"}
 
+        # Keep only ads that have at least one allowed payment method
+        valid = [
+            ad for ad in valid
+            if any(
+                m["tradeMethodName"] in ALLOWED_PAYMENT_METHODS
+                for m in ad["adv"]["tradeMethods"]
+            )
+        ]
+
+        if not valid:
+            return {"currency": currency, "success": False,
+                    "error": "No ads with allowed payment methods"}
+
         best  = max(valid, key=lambda x: float(x["adv"]["price"]))
         price = float(best["adv"]["price"])
-        pays  = [m["tradeMethodName"] for m in best["adv"]["tradeMethods"]]
+        pays  = [
+            m["tradeMethodName"] for m in best["adv"]["tradeMethods"]
+            if m["tradeMethodName"] in ALLOWED_PAYMENT_METHODS
+        ]
 
         return {
             "currency":          currency,
