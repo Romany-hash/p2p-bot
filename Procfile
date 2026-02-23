@@ -1,0 +1,1 @@
+worker: python p2p_bot.py
