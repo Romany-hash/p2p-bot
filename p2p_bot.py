@@ -1,18 +1,16 @@
 import os
 import requests
 import threading
-import time
 import datetime
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from telegram import Update, ParseMode
+from telegram import Update
 from telegram.ext import (
-    Updater, CommandHandler,
-    CallbackContext,
+    Application, CommandHandler, ContextTypes
 )
 
 # ─────────────────────────────────────────────────────────────
-# CONFIGURATION — reads from Railway environment variables
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = int(os.environ.get("CHAT_ID", "0"))
@@ -41,17 +39,17 @@ logger = logging.getLogger(__name__)
 # STATE
 # ─────────────────────────────────────────────────────────────
 state = {
-    "usdt_amount":    100.0,
-    "threshold_egp":  None,
-    "auto_interval":  60,
-    "auto_active":    False,
-    "last_fetch":     None,
-    "last_results":   [],
-    "alerted_keys":   set(),
+    "usdt_amount":   100.0,
+    "threshold_egp": None,
+    "auto_interval": 60,
+    "auto_active":   False,
+    "last_fetch":    None,
+    "last_results":  [],
+    "alerted_keys":  set(),
 }
 
 # ─────────────────────────────────────────────────────────────
-# BACKEND
+# BACKEND  (runs in thread pool — blocking requests are fine)
 # ─────────────────────────────────────────────────────────────
 def get_exchange_rate_to_egp(from_currency, amount):
     if from_currency == "EGP":
@@ -62,8 +60,7 @@ def get_exchange_rate_to_egp(from_currency, amount):
         data = r.json()
         if "rates" in data and "EGP" in data["rates"]:
             return amount * data["rates"]["EGP"]
-        url2 = "https://api.exchangerate-api.com/v4/latest/EGP"
-        r2 = requests.get(url2, timeout=5)
+        r2   = requests.get("https://api.exchangerate-api.com/v4/latest/EGP", timeout=5)
         data2 = r2.json()
         if "rates" in data2 and from_currency in data2["rates"]:
             return amount / data2["rates"][from_currency]
@@ -128,7 +125,6 @@ def get_p2p_price_for_currency(currency, usdt_amount):
                 float(best["advertiser"].get("monthFinishRate", 0)) * 100, 2
             ),
             "monthly_orders":    int(best["advertiser"].get("monthOrderCount", 0)),
-            "valid_ads_found":   len(valid),
             "success":           True,
         }
     except requests.exceptions.Timeout:
@@ -137,8 +133,9 @@ def get_p2p_price_for_currency(currency, usdt_amount):
         return {"currency": currency, "success": False, "error": str(e)}
 
 
-def fetch_all(usdt_amount, max_workers=10):
-    results, errors = [], []
+def fetch_all_blocking(usdt_amount, max_workers=10):
+    """Runs in a background thread — do NOT await this."""
+    results = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
             ex.submit(get_p2p_price_for_currency, c, usdt_amount): c
@@ -150,22 +147,21 @@ def fetch_all(usdt_amount, max_workers=10):
                 egp = get_exchange_rate_to_egp(r["currency"], r["total_in_currency"])
                 r["egp_equivalent"] = egp
                 results.append(r)
-            else:
-                errors.append(r)
 
     results.sort(key=lambda x: x.get("egp_equivalent") or 0, reverse=True)
-    return results, errors
+    return results
 
 
 # ─────────────────────────────────────────────────────────────
 # FORMATTERS
 # ─────────────────────────────────────────────────────────────
-def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
+def fmt_results(results, usdt_amount, label="📊 Latest Rates"):
     if not results:
         return "❌ No results found."
 
     ts   = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
     best = results[0]
+    egp_best = f"{best['egp_equivalent']:,.2f}" if best.get("egp_equivalent") else "N/A"
 
     lines = [
         f"*{label}*",
@@ -173,13 +169,13 @@ def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
         f"🕐 `{ts}`",
         "",
         "🏆 *BEST OFFER*",
-        f"  Currency  : `{best['currency']}`",
-        f"  Price     : `{best['price']:.4f}` {best['currency']}/USDT",
-        f"  You get   : `{best['total_in_currency']:,.2f}` {best['currency']}",
-        f"  EGP equiv : `{best['egp_equivalent']:,.2f}` EGP",
-        f"  Merchant  : {best['merchant']} \\({best['completion_pct']}%\\)",
-        f"  Payment   : {', '.join(best['payment_methods'][:3])}",
-        f"  Limits    : {best['min']:.0f} – {best['max']:.0f} USDT",
+        f"  Currency : `{best['currency']}`",
+        f"  Price    : `{best['price']:.4f}` {best['currency']}/USDT",
+        f"  You get  : `{best['total_in_currency']:,.2f}` {best['currency']}",
+        f"  EGP      : `{egp_best}` EGP",
+        f"  Merchant : `{best['merchant']}` ({best['completion_pct']}%)",
+        f"  Payment  : {', '.join(best['payment_methods'][:3])}",
+        f"  Limits   : {best['min']:.0f} - {best['max']:.0f} USDT",
         "",
         "─────────────────────────",
         f"*TOP {min(10, len(results))} OFFERS*",
@@ -188,36 +184,35 @@ def fmt_results_message(results, usdt_amount, label="📊 Latest Rates"):
 
     for i, r in enumerate(results[:10]):
         egp_s = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
-        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"  {i+1}\\."
+        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
         lines.append(
-            f"{medal} `{r['currency']}` — "
-            f"`{r['price']:.4f}` → `{egp_s}` EGP \\| "
-            f"{r['merchant']} \\| {', '.join(r['payment_methods'][:2])}"
+            f"{medal} `{r['currency']}` "
+            f"price `{r['price']:.4f}` "
+            f"= `{egp_s}` EGP "
+            f"| {r['merchant']}"
         )
 
-    lines += [
-        "",
-        f"_Checked {len(HSBC_SUPPORTED_CURRENCIES)} currencies_",
-    ]
+    lines += ["", f"_Checked {len(HSBC_SUPPORTED_CURRENCIES)} currencies_"]
     return "\n".join(lines)
 
 
-def fmt_alert_message(r, usdt_amount, threshold):
+def fmt_alert(r, usdt_amount, threshold):
     non_excluded = [p for p in r["payment_methods"]
                     if p not in EXCLUDED_PAYMENT_METHODS]
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+    egp = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
     return "\n".join([
-        f"🚨 *PRICE ALERT*  `{ts}`",
+        f"🚨 *PRICE ALERT* `{ts}`",
         "",
         f"  Currency  : `{r['currency']}`",
         f"  Price     : `{r['price']:.4f}` {r['currency']}/USDT",
         f"  You get   : `{r['total_in_currency']:,.2f}` {r['currency']}",
-        f"  EGP equiv : `{r['egp_equivalent']:,.2f}` EGP",
-        f"  Threshold : `{threshold:,.2f}` EGP  ⬆️ EXCEEDED",
-        f"  Merchant  : {r['merchant']}  \\({r['completion_pct']}%\\)",
+        f"  EGP equiv : `{egp}` EGP",
+        f"  Threshold : `{threshold:,.2f}` EGP exceeded",
+        f"  Merchant  : `{r['merchant']}` ({r['completion_pct']}%)",
         f"  Orders/mo : {r['monthly_orders']}",
         f"  Payment   : {', '.join(non_excluded)}",
-        f"  Limits    : {r['min']:.0f} – {r['max']:.0f} USDT",
+        f"  Limits    : {r['min']:.0f} - {r['max']:.0f} USDT",
         f"  Available : {r['available']:.2f} USDT",
     ])
 
@@ -225,7 +220,7 @@ def fmt_alert_message(r, usdt_amount, threshold):
 # ─────────────────────────────────────────────────────────────
 # ALERT CHECKER
 # ─────────────────────────────────────────────────────────────
-def check_and_send_alerts(bot, results, usdt_amount):
+async def check_and_send_alerts(bot, results, usdt_amount):
     threshold = state["threshold_egp"]
     if threshold is None:
         return
@@ -245,20 +240,20 @@ def check_and_send_alerts(bot, results, usdt_amount):
             continue
         state["alerted_keys"].add(key)
 
-        msg = fmt_alert_message(r, usdt_amount, threshold)
+        msg = fmt_alert(r, usdt_amount, threshold)
         try:
-            bot.send_message(
-                chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN_V2
+            await bot.send_message(
+                chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
             )
             logger.info(f"Alert sent: {r['currency']} @ {r['price']}")
         except Exception as e:
-            logger.error(f"Failed to send alert: {e}")
+            logger.error(f"Alert send failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-# COMMANDS
+# COMMANDS  (all async in v20)
 # ─────────────────────────────────────────────────────────────
-def cmd_start(update: Update, context: CallbackContext):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "👋 *Binance P2P Rate Bot*\n\n"
         "Commands:\n\n"
@@ -269,74 +264,82 @@ def cmd_start(update: Update, context: CallbackContext):
         "/autostart 60 — auto check every N seconds\n"
         "/autostop — stop auto refresh\n"
         "/status — show current settings\n"
-        "/top5 — show top 5 from last fetch\n"
+        "/top5 — top 5 from last fetch\n"
     )
-    update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-def cmd_fetch(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        f"⏳ Fetching rates for `{state['usdt_amount']} USDT`…",
-        parse_mode=ParseMode.MARKDOWN
+async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"⏳ Fetching rates for `{state['usdt_amount']} USDT`...",
+        parse_mode="Markdown"
     )
     state["alerted_keys"].clear()
 
-    def worker():
-        results, _ = fetch_all(state["usdt_amount"])
-        state["last_results"] = results
-        state["last_fetch"]   = datetime.datetime.now()
-        msg = fmt_results_message(results, state["usdt_amount"])
-        try:
-            context.bot.send_message(
-                chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            # fallback without markdown
-            context.bot.send_message(chat_id=CHAT_ID, text=msg)
-        check_and_send_alerts(context.bot, results, state["usdt_amount"])
+    import asyncio
+    loop = asyncio.get_event_loop()
 
-    threading.Thread(target=worker, daemon=True).start()
+    # Run blocking fetch in executor so bot stays responsive
+    results = await loop.run_in_executor(
+        None, fetch_all_blocking, state["usdt_amount"]
+    )
+
+    state["last_results"] = results
+    state["last_fetch"]   = datetime.datetime.now()
+
+    msg = fmt_results(results, state["usdt_amount"])
+    try:
+        await context.bot.send_message(
+            chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Send error: {e}")
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+
+    await check_and_send_alerts(context.bot, results, state["usdt_amount"])
 
 
-def cmd_setamount(update: Update, context: CallbackContext):
+async def cmd_setamount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(context.args[0])
         if amount <= 0:
             raise ValueError
         state["usdt_amount"] = amount
         state["alerted_keys"].clear()
-        update.message.reply_text(f"✅ Amount set to `{amount}` USDT",
-                                  parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"✅ Amount set to `{amount}` USDT", parse_mode="Markdown"
+        )
     except (IndexError, ValueError):
-        update.message.reply_text("❌ Usage: `/setamount 500`",
-                                  parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "❌ Usage: `/setamount 500`", parse_mode="Markdown"
+        )
 
 
-def cmd_setalert(update: Update, context: CallbackContext):
+async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         threshold = float(context.args[0].replace(",", ""))
         if threshold <= 0:
             raise ValueError
         state["threshold_egp"] = threshold
         state["alerted_keys"].clear()
-        update.message.reply_text(
+        await update.message.reply_text(
             f"🔔 Alert set for `{threshold:,.2f}` EGP\n"
             f"_Alipay excluded from alerts_",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode="Markdown"
         )
     except (IndexError, ValueError):
-        update.message.reply_text("❌ Usage: `/setalert 650000`",
-                                  parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "❌ Usage: `/setalert 650000`", parse_mode="Markdown"
+        )
 
 
-def cmd_cancelalert(update: Update, context: CallbackContext):
+async def cmd_cancelalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["threshold_egp"] = None
     state["alerted_keys"].clear()
-    update.message.reply_text("🔕 Alert disabled.")
+    await update.message.reply_text("🔕 Alert disabled.")
 
 
-def cmd_autostart(update: Update, context: CallbackContext):
+async def cmd_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         interval = int(context.args[0]) if context.args else 60
         if interval < 10:
@@ -344,7 +347,9 @@ def cmd_autostart(update: Update, context: CallbackContext):
         state["auto_interval"] = interval
         state["auto_active"]   = True
 
-        for job in context.job_queue.get_jobs_by_name("auto_refresh"):
+        # Remove existing job if any
+        current = context.job_queue.get_jobs_by_name("auto_refresh")
+        for job in current:
             job.schedule_removal()
 
         context.job_queue.run_repeating(
@@ -353,86 +358,91 @@ def cmd_autostart(update: Update, context: CallbackContext):
             first=5,
             name="auto_refresh"
         )
-        update.message.reply_text(
+        await update.message.reply_text(
             f"▶️ Auto-refresh every `{interval}` seconds started.",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode="Markdown"
         )
     except (ValueError, IndexError):
-        update.message.reply_text("❌ Usage: `/autostart 60` (minimum 10)",
-                                  parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "❌ Usage: `/autostart 60` (min 10 seconds)",
+            parse_mode="Markdown"
+        )
 
 
-def cmd_autostop(update: Update, context: CallbackContext):
+async def cmd_autostop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["auto_active"] = False
     for job in context.job_queue.get_jobs_by_name("auto_refresh"):
         job.schedule_removal()
-    update.message.reply_text("⏹ Auto-refresh stopped.")
+    await update.message.reply_text("⏹ Auto-refresh stopped.")
 
 
-def cmd_status(update: Update, context: CallbackContext):
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     threshold = state["threshold_egp"]
     last      = state["last_fetch"]
     last_s    = last.strftime("%H:%M:%S") if last else "Never"
     auto_s    = f"every {state['auto_interval']}s" if state["auto_active"] else "OFF"
     msg = (
         f"⚙️ *Settings*\n\n"
-        f"  USDT amount  : `{state['usdt_amount']}`\n"
-        f"  Alert thresh : `{f'{threshold:,.2f} EGP' if threshold else 'Disabled'}`\n"
-        f"  Auto-refresh : `{auto_s}`\n"
-        f"  Last fetch   : `{last_s}`\n"
+        f"  USDT amount   : `{state['usdt_amount']}`\n"
+        f"  Alert thresh  : `{f'{threshold:,.2f} EGP' if threshold else 'Disabled'}`\n"
+        f"  Auto-refresh  : `{auto_s}`\n"
+        f"  Last fetch    : `{last_s}`\n"
         f"  Cached results: `{len(state['last_results'])}`\n"
-        f"  Excluded pay : `{', '.join(EXCLUDED_PAYMENT_METHODS)}`"
+        f"  Excluded pay  : `{', '.join(EXCLUDED_PAYMENT_METHODS)}`"
     )
-    update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-def cmd_top5(update: Update, context: CallbackContext):
+async def cmd_top5(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = state["last_results"]
     if not results:
-        update.message.reply_text("No data yet. Use /fetch first.")
+        await update.message.reply_text("No data yet. Use /fetch first.")
         return
-    msg = fmt_results_message(results[:5], state["usdt_amount"],
-                               label="📊 Top 5 Offers")
+    msg = fmt_results(results[:5], state["usdt_amount"], label="📊 Top 5 Offers")
     try:
-        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception:
-        update.message.reply_text(msg)
+        await update.message.reply_text(msg)
 
 
 # ─────────────────────────────────────────────────────────────
 # AUTO REFRESH JOB
 # ─────────────────────────────────────────────────────────────
-def _auto_refresh_job(context: CallbackContext):
+async def _auto_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     if not state["auto_active"]:
         return
     logger.info("Auto-refresh running...")
-    results, _ = fetch_all(state["usdt_amount"])
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(
+        None, fetch_all_blocking, state["usdt_amount"]
+    )
+
     state["last_results"] = results
     state["last_fetch"]   = datetime.datetime.now()
-    check_and_send_alerts(context.bot, results, state["usdt_amount"])
+    await check_and_send_alerts(context.bot, results, state["usdt_amount"])
 
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
-    updater = Updater(token=BOT_TOKEN, use_context=True)
-    dp      = updater.dispatcher
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    dp.add_handler(CommandHandler("start",       cmd_start))
-    dp.add_handler(CommandHandler("help",        cmd_start))
-    dp.add_handler(CommandHandler("fetch",       cmd_fetch))
-    dp.add_handler(CommandHandler("setamount",   cmd_setamount))
-    dp.add_handler(CommandHandler("setalert",    cmd_setalert))
-    dp.add_handler(CommandHandler("cancelalert", cmd_cancelalert))
-    dp.add_handler(CommandHandler("autostart",   cmd_autostart))
-    dp.add_handler(CommandHandler("autostop",    cmd_autostop))
-    dp.add_handler(CommandHandler("status",      cmd_status))
-    dp.add_handler(CommandHandler("top5",        cmd_top5))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_start))
+    app.add_handler(CommandHandler("fetch",       cmd_fetch))
+    app.add_handler(CommandHandler("setamount",   cmd_setamount))
+    app.add_handler(CommandHandler("setalert",    cmd_setalert))
+    app.add_handler(CommandHandler("cancelalert", cmd_cancelalert))
+    app.add_handler(CommandHandler("autostart",   cmd_autostart))
+    app.add_handler(CommandHandler("autostop",    cmd_autostop))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("top5",        cmd_top5))
 
     logger.info("Bot is running...")
-    updater.start_polling()
-    updater.idle()
+    app.run_polling()
 
 
 if __name__ == "__main__":
