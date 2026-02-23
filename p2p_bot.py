@@ -27,7 +27,11 @@ HSBC_SUPPORTED_CURRENCIES = [
     "JPY", "CNY", "EGP",
 ]
 
-EXCLUDED_PAYMENT_METHODS = {"Alipay"}
+ALLOWED_PAYMENT_METHODS = {
+    "Bank Transfer",
+    "Faster Payment",
+    "Instant Transfer",
+}
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
