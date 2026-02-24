@@ -2,10 +2,7 @@
 nixPkgs = ["python313", "gcc"]
 
 [phases.install]
-cmds = [
-    "pip install --upgrade pip",
-    "pip install 'python-telegram-bot[job-queue]==21.6' requests"
-]
+cmds = ["pip install --upgrade pip", "pip install 'python-telegram-bot[job-queue]==21.6' requests"]
 
 [start]
-cmd = "python buy_bot.py"  # Update this to match your filename
+cmd = "python p2p_bot.py"
