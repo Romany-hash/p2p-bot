@@ -1,460 +1,450 @@
 import os
-import asyncio
 import requests
 import datetime
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters
+)
 
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = int(os.environ.get("CHAT_ID", "0"))
-
 if not BOT_TOKEN or CHAT_ID == 0:
     raise ValueError("BOT_TOKEN and CHAT_ID must be set in environment variables")
 
-# ─────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────
-HSBC_SUPPORTED_CURRENCIES = [
-    "GBP", "EUR", "USD", "AUD", "ZAR", "PLN", "CAD", "NZD",
-    "CHF", "SEK", "HKD", "AED", "CZK", "NOK", "DKK", "SGD",
-    "JPY", "CNY", "EGP",
-]
+# ── Constants ─────────────────────────────────────────────────────────────────
+ASSETS     = ["USDT", "BTC", "BNB"]
+FIAT_LIST  = ["GBP", "EUR", "USD", "AUD", "ZAR", "PLN", "CAD", "NZD",
+              "CHF", "SEK", "HKD", "AED", "CZK", "NOK", "DKK", "SGD",
+              "JPY", "CNY", "EGP"]
+PAY_METHODS = {"Bank Transfer", "Faster Payment", "Instant Transfer"}
 
-ALLOWED_PAYMENT_METHODS = {
-    "Bank Transfer",
-    "Faster Payment",
-    "Instant Transfer",
+# ── State ─────────────────────────────────────────────────────────────────────
+state = {
+    "amount_gbp": 500.0,
+    "asset":      "USDT",   # USDT | BTC | BNB
+    "trade_type": "SELL",   # SELL | BUY
+    "last_fetch": None,
+    "alert_threshold": None,
+    "auto_job": None,
 }
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────────────────────
-state = {
-    "usdt_amount":   100.0,
-    "threshold_egp": None,
-    "auto_interval": 60,
-    "auto_active":   False,
-    "last_fetch":    None,
-    "last_results":  [],
-    "alerted_keys":  set(),
-}
-
-# ─────────────────────────────────────────────────────────────
-# BACKEND
-# ─────────────────────────────────────────────────────────────
-def get_exchange_rate_to_egp(from_currency, amount):
-    if from_currency == "EGP":
-        return amount
-    try:
-        url = f"https://api.exchangerate-api.com/v4/latest/{from_currency}"
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        if "rates" in data and "EGP" in data["rates"]:
-            return amount * data["rates"]["EGP"]
-        r2    = requests.get("https://api.exchangerate-api.com/v4/latest/EGP", timeout=5)
-        data2 = r2.json()
-        if "rates" in data2 and from_currency in data2["rates"]:
-            return amount / data2["rates"][from_currency]
-    except Exception:
-        pass
-    return None
-
-
-def get_p2p_price_for_currency(currency, usdt_amount):
+# ── Binance P2P ───────────────────────────────────────────────────────────────
+def fetch_p2p(fiat: str, asset: str, trade_type: str, amount: float) -> dict:
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
-        "fiat": currency, "page": 1, "rows": 20,
-        "tradeType": "SELL", "asset": "USDT",
-        "countries": [], "proMerchantAds": False, "shieldMerchantAds": False,
-        "filterType": "all", "periods": [], "additionalKycVerifyFilter": 0,
-        "publisherType": None, "payTypes": [],
+        "fiat": fiat,
+        "page": 1,
+        "rows": 20,
+        "tradeType": trade_type,
+        "asset": asset,
+        "countries": [],
+        "proMerchantAds": False,
+        "shieldMerchantAds": False,
+        "filterType": "all",
+        "periods": [],
+        "additionalKycVerifyFilter": 0,
+        "publisherType": None,
+        "payTypes": [],
         "classifies": ["mass", "profession", "fiat_trade"],
-        "transAmount": usdt_amount,
+        "transAmount": str(amount),
     }
     headers = {
-        "Accept": "*/*", "Content-Type": "application/json",
+        "Content-Type": "application/json",
         "Origin": "https://p2p.binance.com",
-        "Referer": "https://p2p.binance.com/en/trade/sell/USDT",
+        "Referer": "https://p2p.binance.com/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     }
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return {"currency": currency, "success": False,
-                    "error": f"HTTP {resp.status_code}"}
-        data = resp.json()
-        ads  = data.get("data") or []
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return {"success": False, "error": f"HTTP {r.status_code}"}
+        ads = r.json().get("data") or []
         if not ads:
-            return {"currency": currency, "success": False, "error": "No ads"}
+            return {"success": False, "error": "No ads found"}
 
-        # Filter by amount and availability
-        valid = []
-        for ad in ads:
-            mn  = float(ad["adv"]["minSingleTransAmount"])
-            mx  = float(ad["adv"]["dynamicMaxSingleTransAmount"])
-            avl = float(ad["adv"]["surplusAmount"])
-            if mn <= usdt_amount <= mx and avl >= usdt_amount:
-                valid.append(ad)
-
-        if not valid:
-            return {"currency": currency, "success": False,
-                    "error": f"No merchant accepts {usdt_amount} USDT"}
-
-        # Filter by allowed payment methods
+        # filter by amount range
         valid = [
-            ad for ad in valid
-            if any(
-                m["tradeMethodName"] in ALLOWED_PAYMENT_METHODS
-                for m in ad["adv"]["tradeMethods"]
-            )
+            a for a in ads
+            if float(a["adv"]["minSingleTransAmount"]) <= amount
+            <= float(a["adv"]["dynamicMaxSingleTransAmount"])
+            and float(a["adv"]["surplusAmount"]) >= amount
         ]
-
         if not valid:
-            return {"currency": currency, "success": False,
-                    "error": "No ads with allowed payment methods"}
+            return {"success": False, "error": "No ads match your amount"}
 
-        best  = max(valid, key=lambda x: float(x["adv"]["price"]))
-        price = float(best["adv"]["price"])
-        pays  = [
-            m["tradeMethodName"] for m in best["adv"]["tradeMethods"]
-            if m["tradeMethodName"] in ALLOWED_PAYMENT_METHODS
+        # filter by payment method
+        valid = [
+            a for a in valid
+            if any(m["tradeMethodName"] in PAY_METHODS
+                   for m in a["adv"]["tradeMethods"])
         ]
+        if not valid:
+            return {"success": False, "error": "No ads with allowed payment methods"}
+
+        # SELL → highest price wins  |  BUY → lowest price wins
+        if trade_type == "SELL":
+            best = max(valid, key=lambda x: float(x["adv"]["price"]))
+        else:
+            best = min(valid, key=lambda x: float(x["adv"]["price"]))
+
+        price   = float(best["adv"]["price"])
+        methods = [m["tradeMethodName"] for m in best["adv"]["tradeMethods"]
+                   if m["tradeMethodName"] in PAY_METHODS]
 
         return {
-            "currency":          currency,
-            "price":             price,
-            "total_in_currency": usdt_amount * price,
-            "merchant":          best["advertiser"]["nickName"],
-            "payment_methods":   pays,
-            "min":               float(best["adv"]["minSingleTransAmount"]),
-            "max":               float(best["adv"]["dynamicMaxSingleTransAmount"]),
-            "available":         float(best["adv"]["surplusAmount"]),
-            "completion_pct":    round(
-                float(best["advertiser"].get("monthFinishRate", 0)) * 100, 2
-            ),
-            "monthly_orders":    int(best["advertiser"].get("monthOrderCount", 0)),
-            "success":           True,
+            "success":      True,
+            "fiat":         fiat,
+            "asset":        asset,
+            "trade_type":   trade_type,
+            "price":        price,
+            "merchant":     best["advertiser"]["nickName"],
+            "completion":   round(float(best["advertiser"].get("monthFinishRate", 0)) * 100, 1),
+            "orders":       int(best["advertiser"].get("monthOrderCount", 0)),
+            "methods":      methods,
+            "min":          float(best["adv"]["minSingleTransAmount"]),
+            "max":          float(best["adv"]["dynamicMaxSingleTransAmount"]),
+            "available":    float(best["adv"]["surplusAmount"]),
         }
-    except requests.exceptions.Timeout:
-        return {"currency": currency, "success": False, "error": "Timeout"}
     except Exception as e:
-        return {"currency": currency, "success": False, "error": str(e)}
+        return {"success": False, "error": str(e)}
 
 
-def fetch_all_blocking(usdt_amount, max_workers=10):
-    """Runs in a background thread — do NOT await this."""
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(get_p2p_price_for_currency, c, usdt_amount): c
-            for c in HSBC_SUPPORTED_CURRENCIES
-        }
-        for fut in as_completed(futures):
-            r = fut.result()
-            if r["success"]:
-                egp = get_exchange_rate_to_egp(r["currency"], r["total_in_currency"])
-                r["egp_equivalent"] = egp
-                results.append(r)
-
-    results.sort(key=lambda x: x.get("egp_equivalent") or 0, reverse=True)
-    return results
+def get_egp_rate(fiat: str) -> float | None:
+    """Get how many EGP = 1 unit of fiat via exchangerate-api."""
+    try:
+        r = requests.get(
+            f"https://api.exchangerate-api.com/v4/latest/{fiat}", timeout=5
+        )
+        return r.json()["rates"].get("EGP")
+    except Exception:
+        return None
 
 
-# ─────────────────────────────────────────────────────────────
-# FORMATTERS
-# ─────────────────────────────────────────────────────────────
-def fmt_results(results, usdt_amount, label="📊 Latest Rates"):
-    if not results:
-        return "❌ No results found."
-
-    ts       = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
-    best     = results[0]
-    egp_best = f"{best['egp_equivalent']:,.2f}" if best.get("egp_equivalent") else "N/A"
+# ── Core fetch logic ──────────────────────────────────────────────────────────
+def run_fetch(amount_gbp: float, asset: str, trade_type: str) -> str:
+    ts = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
+    emoji_asset = {"USDT": "💵", "BTC": "₿", "BNB": "🔶"}.get(asset, "💰")
+    emoji_trade = "📤 SELL" if trade_type == "SELL" else "📥 BUY"
+    egp_gbp = get_egp_rate("GBP")
 
     lines = [
-        f"*{label}*",
-        f"💵 Amount: `{usdt_amount} USDT`",
+        f"{emoji_asset} *{asset} — {emoji_trade} — HSBC UK Currencies*",
         f"🕐 `{ts}`",
-        "",
-        "🏆 *BEST OFFER*",
-        f"  Currency : `{best['currency']}`",
-        f"  Price    : `{best['price']:.4f}` {best['currency']}/USDT",
-        f"  You get  : `{best['total_in_currency']:,.2f}` {best['currency']}",
-        f"  EGP      : `{egp_best}` EGP",
-        f"  Merchant : `{best['merchant']}` ({best['completion_pct']}%)",
-        f"  Payment  : {', '.join(best['payment_methods'][:3])}",
-        f"  Limits   : {best['min']:.0f} - {best['max']:.0f} USDT",
-        "",
-        "─────────────────────────",
-        f"*TOP {min(10, len(results))} OFFERS*",
+        f"💷 Amount : `{amount_gbp:,.2f}` GBP"
+        + (f"  ≈  `{amount_gbp * egp_gbp:,.0f}` EGP" if egp_gbp else ""),
         "",
     ]
 
+    results = []
+    for fiat in FIAT_LIST:
+        # For non-GBP fiats convert GBP → fiat to know the transaction amount
+        if fiat == "GBP":
+            amount_fiat = amount_gbp
+        else:
+            rate = get_egp_rate(fiat)    # EGP per 1 fiat
+            egp_per_gbp = egp_gbp        # EGP per 1 GBP
+            if rate and egp_per_gbp:
+                amount_fiat = amount_gbp * egp_per_gbp / rate
+            else:
+                amount_fiat = amount_gbp  # fallback
+
+        res = fetch_p2p(fiat, asset, trade_type, amount_fiat)
+        if not res["success"]:
+            continue
+
+        # EGP equivalent of the fiat price
+        egp_rate = get_egp_rate(fiat)
+        egp_price = res["price"] * egp_rate if egp_rate else None
+
+        res["egp_price"]  = egp_price
+        res["amount_fiat"] = amount_fiat
+        results.append(res)
+
+    if not results:
+        return "❌ No results found for any currency."
+
+    # Sort: SELL → highest EGP price first  |  BUY → lowest EGP price first
+    results.sort(
+        key=lambda x: x["egp_price"] or 0,
+        reverse=(trade_type == "SELL")
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
     for i, r in enumerate(results[:10]):
-        egp_s = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
-        medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
+        medal = medals[i] if i < 3 else f"{i+1}."
+        egp_str = f"`{r['egp_price']:,.2f}` EGP" if r["egp_price"] else "N/A"
         lines.append(
-            f"{medal} `{r['currency']}` "
-            f"price `{r['price']:.4f}` "
-            f"= `{egp_s}` EGP "
-            f"| {r['merchant']}"
+            f"{medal} *{r['fiat']}*  •  "
+            f"`{r['price']:,.6f}` {r['fiat']}/{r['asset']}  "
+            f"≈  {egp_str}\n"
+            f"     👤 {r['merchant']} ({r['completion']}%  {r['orders']} orders)\n"
+            f"     💳 {' | '.join(r['methods'])}\n"
+            f"     📊 Limits: {r['min']:,.0f} – {r['max']:,.0f} {r['fiat']}\n"
         )
 
-    lines += ["", f"_Checked {len(HSBC_SUPPORTED_CURRENCIES)} currencies_"]
+    state["last_fetch"] = datetime.datetime.now()
     return "\n".join(lines)
 
 
-def fmt_alert(r, usdt_amount, threshold):
-    allowed_pays = [p for p in r["payment_methods"] if p in ALLOWED_PAYMENT_METHODS]
-    ts  = datetime.datetime.now().strftime("%H:%M:%S")
-    egp = f"{r['egp_equivalent']:,.2f}" if r.get("egp_equivalent") else "N/A"
-    return "\n".join([
-        f"🚨 *PRICE ALERT* `{ts}`",
-        "",
-        f"  Currency  : `{r['currency']}`",
-        f"  Price     : `{r['price']:.4f}` {r['currency']}/USDT",
-        f"  You get   : `{r['total_in_currency']:,.2f}` {r['currency']}",
-        f"  EGP equiv : `{egp}` EGP",
-        f"  Threshold : `{threshold:,.2f}` EGP exceeded",
-        f"  Merchant  : `{r['merchant']}` ({r['completion_pct']}%)",
-        f"  Orders/mo : {r['monthly_orders']}",
-        f"  Payment   : {', '.join(allowed_pays)}",
-        f"  Limits    : {r['min']:.0f} - {r['max']:.0f} USDT",
-        f"  Available : {r['available']:.2f} USDT",
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 SELL", callback_data="set_trade_SELL"),
+            InlineKeyboardButton("📥 BUY",  callback_data="set_trade_BUY"),
+        ],
+        [
+            InlineKeyboardButton("💵 USDT", callback_data="set_asset_USDT"),
+            InlineKeyboardButton("₿ BTC",   callback_data="set_asset_BTC"),
+            InlineKeyboardButton("🔶 BNB",  callback_data="set_asset_BNB"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Fetch Now", callback_data="do_fetch"),
+        ],
     ])
 
 
-# ─────────────────────────────────────────────────────────────
-# ALERT CHECKER
-# ─────────────────────────────────────────────────────────────
-async def check_and_send_alerts(bot, results, usdt_amount):
-    threshold = state["threshold_egp"]
-    if threshold is None:
-        return
-
-    for r in results:
-        egp = r.get("egp_equivalent")
-        if not egp or egp <= threshold:
-            continue
-
-        allowed_pays = [p for p in r["payment_methods"] if p in ALLOWED_PAYMENT_METHODS]
-        if not allowed_pays:
-            continue
-
-        key = (r["currency"], round(r["price"], 4))
-        if key in state["alerted_keys"]:
-            continue
-        state["alerted_keys"].add(key)
-
-        msg = fmt_alert(r, usdt_amount, threshold)
-        try:
-            await bot.send_message(
-                chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
-            )
-            logger.info(f"Alert sent: {r['currency']} @ {r['price']}")
-        except Exception as e:
-            logger.error(f"Alert send failed: {e}")
-
-
-# ─────────────────────────────────────────────────────────────
-# COMMANDS
-# ─────────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "👋 *Binance P2P Rate Bot*\n\n"
-        "Commands:\n\n"
-        "/fetch — fetch prices now\n"
-        "/setamount 500 — set USDT amount\n"
-        "/setalert 650000 — alert when EGP exceeds value\n"
-        "/cancelalert — disable alert\n"
-        "/autostart 60 — auto check every N seconds\n"
-        "/autostop — stop auto refresh\n"
-        "/status — show current settings\n"
-        "/top5 — top 5 from last fetch\n"
+        "👋 *Binance P2P Bot*\n\n"
+        "Commands:\n"
+        "/setgbp `500`  — set GBP amount\n"
+        "/fetch         — fetch best price now\n"
+        "/sell          — switch to SELL mode\n"
+        "/buy           — switch to BUY mode\n"
+        "/usdt          — switch to USDT\n"
+        "/btc           — switch to BTC\n"
+        "/bnb           — switch to BNB\n"
+        "/autostart `120` — auto-fetch every N seconds\n"
+        "/autostop      — stop auto-fetch\n"
+        "/setalert `650000` — alert when EGP price exceeds value\n"
+        "/status        — current settings\n"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard())
 
 
-async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"⏳ Fetching rates for `{state['usdt_amount']} USDT`...",
-        parse_mode="Markdown"
-    )
-    state["alerted_keys"].clear()
-
-    loop    = asyncio.get_event_loop()
-    results = await loop.run_in_executor(
-        None, fetch_all_blocking, state["usdt_amount"]
-    )
-
-    state["last_results"] = results
-    state["last_fetch"]   = datetime.datetime.now()
-
-    msg = fmt_results(results, state["usdt_amount"])
-    try:
-        await context.bot.send_message(
-            chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Send error: {e}")
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-
-    await check_and_send_alerts(context.bot, results, state["usdt_amount"])
-
-
-async def cmd_setamount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_setgbp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(context.args[0])
         if amount <= 0:
             raise ValueError
-        state["usdt_amount"] = amount
-        state["alerted_keys"].clear()
+        state["amount_gbp"] = amount
         await update.message.reply_text(
-            f"✅ Amount set to `{amount}` USDT", parse_mode="Markdown"
+            f"✅ Amount set to `{amount:,.2f}` GBP", parse_mode="Markdown"
         )
     except (IndexError, ValueError):
-        await update.message.reply_text(
-            "❌ Usage: `/setamount 500`", parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌ Usage: `/setgbp 500`", parse_mode="Markdown")
+
+
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["trade_type"] = "SELL"
+    await update.message.reply_text("✅ Mode set to *SELL*", parse_mode="Markdown")
+
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["trade_type"] = "BUY"
+    await update.message.reply_text("✅ Mode set to *BUY*", parse_mode="Markdown")
+
+
+async def cmd_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["asset"] = "USDT"
+    await update.message.reply_text("✅ Asset set to *USDT*", parse_mode="Markdown")
+
+
+async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["asset"] = "BTC"
+    await update.message.reply_text("✅ Asset set to *BTC*", parse_mode="Markdown")
+
+
+async def cmd_bnb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["asset"] = "BNB"
+    await update.message.reply_text("✅ Asset set to *BNB*", parse_mode="Markdown")
+
+
+async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ Fetching best prices...", parse_mode="Markdown")
+    result = run_fetch(state["amount_gbp"], state["asset"], state["trade_type"])
+    await msg.edit_text(result, parse_mode="Markdown")
 
 
 async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        threshold = float(context.args[0].replace(",", ""))
-        if threshold <= 0:
-            raise ValueError
-        state["threshold_egp"] = threshold
-        state["alerted_keys"].clear()
+        threshold = float(context.args[0])
+        state["alert_threshold"] = threshold
         await update.message.reply_text(
-            f"🔔 Alert set for `{threshold:,.2f}` EGP\n"
-            f"_Only Bank Transfer, Faster Payment, Instant Transfer_",
-            parse_mode="Markdown"
+            f"🔔 Alert set for `{threshold:,.2f}` EGP", parse_mode="Markdown"
         )
     except (IndexError, ValueError):
-        await update.message.reply_text(
-            "❌ Usage: `/setalert 650000`", parse_mode="Markdown"
-        )
-
-
-async def cmd_cancelalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["threshold_egp"] = None
-    state["alerted_keys"].clear()
-    await update.message.reply_text("🔕 Alert disabled.")
-
-
-async def cmd_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        interval = int(context.args[0]) if context.args else 60
-        if interval < 10:
-            raise ValueError
-        state["auto_interval"] = interval
-        state["auto_active"]   = True
-
-        current = context.job_queue.get_jobs_by_name("auto_refresh")
-        for job in current:
-            job.schedule_removal()
-
-        context.job_queue.run_repeating(
-            _auto_refresh_job,
-            interval=interval,
-            first=5,
-            name="auto_refresh"
-        )
-        await update.message.reply_text(
-            f"▶️ Auto-refresh every `{interval}` seconds started.",
-            parse_mode="Markdown"
-        )
-    except (ValueError, IndexError):
-        await update.message.reply_text(
-            "❌ Usage: `/autostart 60` (min 10 seconds)",
-            parse_mode="Markdown"
-        )
-
-
-async def cmd_autostop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["auto_active"] = False
-    for job in context.job_queue.get_jobs_by_name("auto_refresh"):
-        job.schedule_removal()
-    await update.message.reply_text("⏹ Auto-refresh stopped.")
+        await update.message.reply_text("❌ Usage: `/setalert 650000`", parse_mode="Markdown")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    threshold = state["threshold_egp"]
-    last      = state["last_fetch"]
-    last_s    = last.strftime("%H:%M:%S") if last else "Never"
-    auto_s    = f"every {state['auto_interval']}s" if state["auto_active"] else "OFF"
+    last_s = state["last_fetch"].strftime("%H:%M:%S") if state["last_fetch"] else "Never"
+    auto   = "Running ✅" if state["auto_job"] else "Stopped ❌"
     msg = (
-        f"⚙️ *Settings*\n\n"
-        f"  USDT amount   : `{state['usdt_amount']}`\n"
-        f"  Alert thresh  : `{f'{threshold:,.2f} EGP' if threshold else 'Disabled'}`\n"
-        f"  Auto-refresh  : `{auto_s}`\n"
-        f"  Last fetch    : `{last_s}`\n"
-        f"  Cached results: `{len(state['last_results'])}`\n"
-        f"  Allowed pay   : `{', '.join(ALLOWED_PAYMENT_METHODS)}`"
+        f"⚙️ *Status*\n\n"
+        f"  Amount     : `{state['amount_gbp']:,.2f}` GBP\n"
+        f"  Asset      : `{state['asset']}`\n"
+        f"  Trade      : `{state['trade_type']}`\n"
+        f"  Last fetch : `{last_s}`\n"
+        f"  Auto-fetch : {auto}\n"
+        f"  Alert      : `{state['alert_threshold']:,.2f}` EGP"
+        if state["alert_threshold"] else
+        f"⚙️ *Status*\n\n"
+        f"  Amount     : `{state['amount_gbp']:,.2f}` GBP\n"
+        f"  Asset      : `{state['asset']}`\n"
+        f"  Trade      : `{state['trade_type']}`\n"
+        f"  Last fetch : `{last_s}`\n"
+        f"  Auto-fetch : {auto}\n"
+        f"  Alert      : Not set"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_top5(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    results = state["last_results"]
-    if not results:
-        await update.message.reply_text("No data yet. Use /fetch first.")
-        return
-    msg = fmt_results(results[:5], state["usdt_amount"], label="📊 Top 5 Offers")
+# ── Auto-fetch job ─────────────────────────────────────────────────────────────
+async def auto_fetch_job(context: ContextTypes.DEFAULT_TYPE):
+    result = run_fetch(state["amount_gbp"], state["asset"], state["trade_type"])
+    threshold = state["alert_threshold"]
+
+    if threshold:
+        # Check if any result exceeds threshold
+        for line in result.split("\n"):
+            if "EGP" in line:
+                try:
+                    egp_val = float(
+                        line.split("`")[3].replace(",", "")
+                    )
+                    if (state["trade_type"] == "SELL" and egp_val >= threshold) or \
+                       (state["trade_type"] == "BUY"  and egp_val <= threshold):
+                        await context.bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=f"🚨 *ALERT TRIGGERED!*\n\n{result}",
+                            parse_mode="Markdown"
+                        )
+                        return
+                except Exception:
+                    pass
+    else:
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=result,
+            parse_mode="Markdown"
+        )
+
+
+async def cmd_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(msg)
+        interval = int(context.args[0])
+        if interval < 30:
+            await update.message.reply_text("❌ Minimum interval is 30 seconds.")
+            return
+
+        # Remove existing job if any
+        if state["auto_job"]:
+            state["auto_job"].schedule_removal()
+            state["auto_job"] = None
+
+        job = context.job_queue.run_repeating(
+            auto_fetch_job,
+            interval=interval,
+            first=5,
+            chat_id=CHAT_ID,
+        )
+        state["auto_job"] = job
+        await update.message.reply_text(
+            f"▶️ Auto-fetch every `{interval}` seconds started.", parse_mode="Markdown"
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Usage: `/autostart 120`", parse_mode="Markdown")
 
 
-# ─────────────────────────────────────────────────────────────
-# AUTO REFRESH JOB
-# ─────────────────────────────────────────────────────────────
-async def _auto_refresh_job(context: ContextTypes.DEFAULT_TYPE):
-    if not state["auto_active"]:
-        return
-    logger.info("Auto-refresh running...")
-
-    loop    = asyncio.get_event_loop()
-    results = await loop.run_in_executor(
-        None, fetch_all_blocking, state["usdt_amount"]
-    )
-
-    state["last_results"] = results
-    state["last_fetch"]   = datetime.datetime.now()
-    await check_and_send_alerts(context.bot, results, state["usdt_amount"])
+async def cmd_autostop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if state["auto_job"]:
+        state["auto_job"].schedule_removal()
+        state["auto_job"] = None
+        await update.message.reply_text("⏹️ Auto-fetch stopped.")
+    else:
+        await update.message.reply_text("ℹ️ Auto-fetch is not running.")
 
 
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
+# ── Inline button callbacks ────────────────────────────────────────────────────
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("set_trade_"):
+        state["trade_type"] = data.split("_")[2]
+        await query.edit_message_reply_markup(reply_markup=main_keyboard())
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"✅ Mode set to *{state['trade_type']}*",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("set_asset_"):
+        state["asset"] = data.split("_")[2]
+        await query.edit_message_reply_markup(reply_markup=main_keyboard())
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"✅ Asset set to *{state['asset']}*",
+            parse_mode="Markdown"
+        )
+
+    elif data == "do_fetch":
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⏳ Fetching best prices..."
+        )
+        result = run_fetch(state["amount_gbp"], state["asset"], state["trade_type"])
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=result,
+            parse_mode="Markdown"
+        )
+
+
+# ── Handle plain number messages ──────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text.replace(",", ""))
+        if amount > 0:
+            state["amount_gbp"] = amount
+            await update.message.reply_text(
+                f"✅ Amount updated to `{amount:,.2f}` GBP", parse_mode="Markdown"
+            )
+    except ValueError:
+        pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_start))
-    app.add_handler(CommandHandler("fetch",       cmd_fetch))
-    app.add_handler(CommandHandler("setamount",   cmd_setamount))
-    app.add_handler(CommandHandler("setalert",    cmd_setalert))
-    app.add_handler(CommandHandler("cancelalert", cmd_cancelalert))
-    app.add_handler(CommandHandler("autostart",   cmd_autostart))
-    app.add_handler(CommandHandler("autostop",    cmd_autostop))
-    app.add_handler(CommandHandler("status",      cmd_status))
-    app.add_handler(CommandHandler("top5",        cmd_top5))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("setgbp",     cmd_setgbp))
+    app.add_handler(CommandHandler("sell",       cmd_sell))
+    app.add_handler(CommandHandler("buy",        cmd_buy))
+    app.add_handler(CommandHandler("usdt",       cmd_usdt))
+    app.add_handler(CommandHandler("btc",        cmd_btc))
+    app.add_handler(CommandHandler("bnb",        cmd_bnb))
+    app.add_handler(CommandHandler("fetch",      cmd_fetch))
+    app.add_handler(CommandHandler("setalert",   cmd_setalert))
+    app.add_handler(CommandHandler("autostart",  cmd_autostart))
+    app.add_handler(CommandHandler("autostop",   cmd_autostop))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot started.")
+    app.run_polling()
 
 
 if __name__ == "__main__":
